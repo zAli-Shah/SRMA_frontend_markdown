@@ -9,9 +9,9 @@ All URLs below are relative to `/backend/api/v1`. All requests need the usual `A
 ## 1. What the feature does
 
 - A **merged column** can now have an optional `formula`, for example `=ROUND([Et]*100/[Nt], 1)`.
-- When a column has a formula, the backend calculates each cell's value from that column's merged nodes, per paper and per treatment arm, and returns it in a **new key, `formula_result`**.
+- When a column has a formula, the backend calculates each cell's value from that column's merged nodes, per paper and per treatment arm, and returns it in a **new key, `formula_result`**, next to the formula text in **`formula`**.
 - The existing **`result` key is unchanged**: it is always the `data_display_format` text (e.g. `12 / 50`), whether or not the column has a formula.
-- On every merged cell, `formula_result` is `null` when the column has no formula.
+- On every merged cell, `formula` and `formula_result` are `null` when the column has no formula.
 - Only merged columns can have a formula. Normal (non-merged) columns cannot.
 - Values are calculated when the table is read, never stored. They update automatically when extraction values or per-R-table overrides change.
 - Manuscript tables and guideline / public website snapshots get `formula_result` in the same data. Any screen that should show computed values there must read `formula_result` too (see §8).
@@ -113,9 +113,9 @@ Use this endpoint to pre-fill the formula editor and to find which columns are f
 
 > ⚠️ **Known backend bug, not caused by this feature:** `GET /rtable_nodes/get_rtable_node/{project_id}/{rtable_node_id}` currently returns **500 for every merged column**, with or without a formula. The service returns `merge_nodes` but the response schema expects `merge_node_ids`. Until it's fixed, read single merged columns from the list endpoint above.
 
-### 3.4 Table data — `GET /rtable/rtable_data/{project_id}/{rtable_id}` (one new key)
+### 3.4 Table data — `GET /rtable/rtable_data/{project_id}/{rtable_id}` (three new keys)
 
-Each entry in a merged column's `results` now also has **`formula_result`**. Every other key, including `result`, is exactly as before:
+Each entry in a merged column's `results` now also has **`formula_result`**, **`formula`** and **`formula_missing_nodes`**. Every other key, including `result`, is exactly as before:
 
 ```json
 {
@@ -126,6 +126,8 @@ Each entry in a merged column's `results` now also has **`formula_result`**. Eve
     {
       "result": "41 / 65",
       "formula_result": "63.1",
+      "formula": "=ROUND([Et]*100/[Nt], 1)",
+      "formula_missing_nodes": [],
       "subgroup_label": null,
       "treatment_arm_label": "Primary",
       "result_by_node_id": [
@@ -143,11 +145,13 @@ Each entry in a merged column's `results` now also has **`formula_result`**. Eve
 |---|---|
 | `result` | **Unchanged.** The `data_display_format` text (e.g. `"41 / 65"`), or `null` as before. |
 | `formula_result` | `null` if the column has no formula. Otherwise the computed number as a **string**, e.g. `"24"`, `"63.1"`, `"0.0733333333"`, `"-12"`, or `"-"` when it can't be computed (see §4). |
+| `formula` | `null` if the column has no formula. Otherwise the column's formula exactly as saved, e.g. `"=ROUND([Et]*100/[Nt], 1)"`. Same value on every cell of the column. |
+| `formula_missing_nodes` | `null` if the column has no formula. Otherwise a list of the nodes the formula uses whose value is missing or isn't a plain number; empty `[]` when all inputs are numbers. See §4. |
 | `result_by_node_id` | Unchanged. The **input** values, useful for a tooltip such as "Et = 41, Nt = 65". |
 
 - `formula_result` is on **every** merged-column cell, so `formula_result !== null` tells you the column is a formula column.
-- Non-merged columns (`is_merge: false`) have no `formula_result` key.
-- `formula` (the formula text) is not included in `rtable_data`. Get it from the column list (§3.3), e.g. for a header tooltip.
+- Non-merged columns (`is_merge: false`) have no `formula_result`, `formula` or `formula_missing_nodes` key.
+- `formula` lets you show the formula beside the computed value (e.g. a tooltip "=([Et]+[Nt])*3 → 729") without a second request to the column list (§3.3).
 - `is_paper_selected` (default paper selection in multi-paper trials) is still based on `result`, as before. The formula doesn't affect it.
 
 ---
@@ -165,7 +169,29 @@ The backend returns `"-"` rather than guessing when:
 
 Accepted input numbers: `12`, `-3.5`, `.5`, `+3`, `1,234.5`, `1.2e-5`, and `−5` (the PDF minus sign).
 
-**Suggested UI:** show `-` as now. Optionally show a tooltip on formula cells: *"Couldn't calculate: an input is missing or isn't a plain number"*, plus the input values from `result_by_node_id`.
+### Which input is missing: `formula_missing_nodes`
+
+Each formula cell lists the inputs that stopped the calculation, in the order the formula uses them (a node used twice is listed once):
+
+```json
+"formula_result": "-",
+"formula": "=([Et]+[Nt])*3",
+"formula_missing_nodes": [
+  { "node_id": 6165, "node_name": "Et", "value": "N/A" },
+  { "node_id": 6166, "node_name": "Nt", "value": null }
+]
+```
+
+| Entry | Meaning | Suggested text |
+|---|---|---|
+| `value` is a string | The node has a value but it isn't a plain number | *"Et = N/A (not a number)"* |
+| `value` is `null` | The node has no extracted value for this paper / arm | *"Nt is not extracted"* |
+| `node_id` is `null` | The formula names a node that is no longer one of the column's merged nodes (renamed or removed) | *"[Nt] no longer exists in this column; update the formula"* |
+
+- `formula_missing_nodes` is `[]` when every input is a number. If `formula_result` is still `"-"`, the result itself is undefined (e.g. division by zero). Show *"Couldn't calculate (e.g. division by zero)"*.
+- The backend applies the same number rule as the calculation, so the frontend doesn't need to check values itself.
+
+**Suggested UI:** show `-` in the cell as now, with a tooltip built from `formula_missing_nodes`, e.g. *"Couldn't calculate: Et = N/A, Nt not extracted"*.
 
 Combined values like `200 (31.2)` are common in the data. Users must extract events and totals as **separate nodes** for formulas to work.
 
@@ -213,12 +239,12 @@ There is **no separate "validate" endpoint**. Validation happens on create and u
    - Help text with the syntax and examples from §2.
    - Show the backend's `detail` message below the input on 400.
    - A "Remove formula" action sends `"formula": ""`.
-2. **Table header:** mark formula columns, e.g. an ƒx icon with the formula in a tooltip, using `formula` from §3.3.
+2. **Table header:** mark formula columns, e.g. an ƒx icon with the formula in a tooltip, using `formula` from §3.3 or from any cell in §3.4.
 3. **Cells:** for merged columns, show `formula_result` when it isn't `null`, otherwise `result` as today:
    ```js
    const cellText = cell.formula_result ?? cell.result;
    ```
-   Optionally show `result` (the inputs, e.g. `41 / 65`) as a tooltip or secondary line under the computed value.
+   Optionally show `cell.formula` and `result` (the inputs, e.g. `41 / 65`) as a tooltip or secondary line under the computed value.
 4. **Editing a formula cell:** the computed value **cannot be edited directly**; there is no endpoint to store it. To change it, users edit the **input** values: the existing per-R-table override (`PUT /rtable/update_rtable_extraction/{project_id}/{rtable_id}`) on the merged nodes in `result_by_node_id`. Refetch `rtable_data` afterwards and the formula recalculates using the override.
 5. **Sorting:** sorting happens on the frontend. For formula columns, sort by `formula_result` **numerically** (`parseFloat`) with `"-"` last; text sorting would put `"100"` before `"24"`.
 6. **After an I-table/outcome node is renamed:** formulas still reference the old name and show `-`. Consider warning the user to update formulas that use that node.
@@ -230,20 +256,22 @@ There is **no separate "validate" endpoint**. Validation happens on create and u
 - **Manuscript tables and guideline / public website pages** receive the same R-table data from the backend, so their cells also carry `formula_result`. ⚠️ Wherever those screens render R-table cells, apply the same `formula_result ?? result` rule, or they'll keep showing the display text. Snapshots that were already published don't change.
 - **Copy R-table** copies formulas (backend).
 - **Delete column** works as before.
-- Existing R-tables without formulas render exactly as before; the only difference is `formula_result: null` on merged cells (verified on all 112 R-tables in the dev database).
+- Existing R-tables without formulas render exactly as before; the only difference is `formula_result`, `formula` and `formula_missing_nodes` set to `null` on merged cells.
 
 ---
 
 ## 9. Quick test checklist for frontend QA
 
 - [ ] Create a merged column with `=ROUND([Et]*100/[Nt], 1)` → cells show percentages (`formula_result`), and `result` still holds `Et / Nt` text.
-- [ ] A merged column without a formula → `formula_result` is `null` and cells look exactly as before.
+- [ ] Each cell of that column has `formula` = `=ROUND([Et]*100/[Nt], 1)`.
+- [ ] A merged column without a formula → `formula_result`, `formula` and `formula_missing_nodes` are `null` and cells look exactly as before.
 - [ ] Create with `=[Et]*` → error "Formula is not a valid expression" shown, column not created.
 - [ ] Create with `=[Something]` → error naming `Something`.
 - [ ] Edit the formula → table updates after refetch.
 - [ ] Remove the formula (`""`) → column shows display-format text again.
 - [ ] Override an input value (e.g. Et) for one cell → the formula cell recalculates.
 - [ ] An input of `NR` → cell shows `-`.
+- [ ] Nt is `N/A` for one arm and not extracted for another → `formula_missing_nodes` names Nt with `value: "N/A"` and `value: null`, and the tooltip says which.
 - [ ] Sort the formula column → numeric order, `-` last.
 - [ ] Copy the R-table → the formula column is copied and shows the same values.
 - [ ] Open a manuscript and a guideline page that embed the R-table → computed values appear (after those screens use `formula_result`).
